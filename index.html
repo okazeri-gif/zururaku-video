@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>「ズルラク海外物販」完全攻略動画</title>
+<style>
+  :root {
+    --orange: #ee4d2d;
+    --orange-dark: #d73211;
+    --orange-pale: #fff3ef;
+    --text: #222;
+    --muted: #666;
+    --bg: #fff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", Meiryo, sans-serif;
+    line-height: 1.7;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 0 0 40px; }
+  [hidden] { display: none !important; }
+  .head { background: var(--orange); color: #fff; text-align: center; padding: 24px 16px 20px; }
+  .head .lead { margin: 0; font-size: 15px; font-weight: 700; }
+  .head h1 { margin: 4px 0 0; font-size: 22px; line-height: 1.4; }
+  .remain { margin: 16px; padding: 10px 12px; text-align: center; background: var(--orange-pale); border-radius: 8px; font-size: 15px; }
+  .remain strong { color: var(--orange-dark); font-size: 18px; }
+  .player { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; }
+  .player iframe, .player > div { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .guide { margin: 20px 16px 0; font-size: 16px; }
+  .consult { margin: 24px 16px 0; text-align: center; }
+  .btn {
+    display: block; padding: 16px; border-radius: 999px; background: var(--orange); color: #fff;
+    font-size: 18px; font-weight: 700; text-decoration: none; box-shadow: 0 3px 0 var(--orange-dark);
+  }
+  .btn:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--orange-dark); }
+  .note { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+  .message { padding: 48px 16px; text-align: center; }
+  .message h2 { margin: 0 0 16px; font-size: 20px; color: var(--orange-dark); }
+  .message p { margin: 0; font-size: 15px; }
+  .retry { margin-top: 20px; padding: 10px 20px; border: 1px solid var(--orange); border-radius: 999px; background: #fff; color: var(--orange-dark); font-size: 15px; }
+</style>
+</head>
+<body>
+<main>
+  <section id="loading" class="message"><p>読み込んでいます…</p></section>
+
+  <section id="watch" hidden>
+    <div class="head">
+      <p class="lead">作業の9割はAIにお任せ！</p>
+      <h1>「ズルラク海外物販」完全攻略動画</h1>
+    </div>
+    <p class="remain">このページが見られるのは、<strong id="remain"></strong>です</p>
+    <div class="player"><div id="player"></div></div>
+    <p class="guide">動画の最後に出てくる「合言葉」を、LINEに送ってください。<br>⑤の「利益が跳ねる高額商品10選」をお送りします。</p>
+    <div id="consult" class="consult" hidden>
+      <a id="consultBtn" class="btn" href="#">個別相談の日程を選ぶ</a>
+      <p class="note">申込のご案内は、このページが見られるあいだだけです</p>
+    </div>
+  </section>
+
+  <section id="expired" class="message" hidden>
+    <h2>この動画の公開は終了しました</h2>
+    <p>受け取ってから3日がたったため、見られなくなっています。<br>このあともLINEで、Shopee物販のお役立ち情報をお届けしていきます。</p>
+  </section>
+
+  <section id="error" class="message" hidden>
+    <p>読み込めませんでした。<br>電波の良いところで、もう一度開いてください。</p>
+    <button id="retry" class="retry" type="button">もう一度読み込む</button>
+  </section>
+</main>
+
+<script>
+// ===== 設定（GAS をデプロイしたら GAS_URL だけ書き換える）=====
+var CONFIG = {
+  GAS_URL: 'https://script.google.com/macros/s/ここにデプロイIDを入れる/exec',
+  PROGRESS_SEC: 15,      // 再生中の位置を送る間隔（秒）
+  TIMEOUT_MS: 15000      // 「見てよいか」の問い合わせを待つ時間
+};
+
+var STORE_BID = 'zv_bid';
+var STORE_CONSULT = 'zv_consult';
+
+// ===== 小さな部品（テストで呼ぶ）=====
+
+/** localStorage が使えなければ null（一部のアプリ内ブラウザ） */
+function safeStorage(win) {
+  try {
+    var s = win.localStorage;
+    s.setItem('__zv', '1');
+    s.removeItem('__zv');
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+function storeGet(storage, key) {
+  try { return storage ? storage.getItem(key) : null; } catch (e) { return null; }
+}
+
+function storeSet(storage, key, value) {
+  try { if (storage) storage.setItem(key, value); } catch (e) { /* 保存できなくても動かす */ }
+}
+
+function randomId() {
+  var bytes = new Uint8Array(12);
+  try {
+    crypto.getRandomValues(bytes);
+  } catch (e) {
+    for (var i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  var s = '';
+  for (var j = 0; j < bytes.length; j++) s += ('0' + bytes[j].toString(16)).slice(-2);
+  return s;
+}
+
+/** URL の uid。空・置き換え失敗（#_userParamId_#）は無しとして扱う */
+function readUid(search) {
+  var u = (new URLSearchParams(search).get('uid') || '').trim();
+  if (!u || u.indexOf('userParamId') >= 0 || u.indexOf('#') >= 0) return '';
+  return u;
+}
+
+function readSrc(search) {
+  return (new URLSearchParams(search).get('src') || '').trim();
+}
+
+/** 視聴者ID: uid があれば uid、無ければブラウザに保存したID（無ければ作る。保存できなければその回だけ） */
+function resolveViewer(search, storage) {
+  var uid = readUid(search);
+  if (uid) return { uid: uid };
+  var bid = storeGet(storage, STORE_BID);
+  if (!bid || !/^[0-9a-f]{24}$/.test(bid)) {
+    bid = randomId();
+    storeSet(storage, STORE_BID, bid);
+  }
+  return { bid: bid };
+}
+
+function deviceOf(ua) {
+  return /iPhone|iPad|iPod|Android|Mobile/i.test(ua || '') ? 'スマホ' : 'PC';
+}
+
+/** 残り時間の文言。24時間以上は「あと◯日◯時間」、24時間未満は「あと◯時間」、1時間未満は「あと◯分」 */
+function formatRemaining(ms) {
+  if (ms < 3600000) return 'あと' + Math.max(1, Math.floor(ms / 60000)) + '分';
+  var h = Math.floor(ms / 3600000);
+  if (h < 24) return 'あと' + h + '時間';
+  return 'あと' + Math.floor(h / 24) + '日' + (h % 24) + '時間';
+}
+
+// ===== 画面 =====
+
+function main() {
+  var storage = safeStorage(window);
+  var search = location.search;
+  var who = resolveViewer(search, storage);
+  var base = {
+    uid: who.uid || '',
+    bid: who.bid || '',
+    src: readSrc(search),
+    device: deviceOf(navigator.userAgent),
+    sid: randomId()
+  };
+  var t0 = performance.now();
+  var player = null;
+  var playing = false;
+  var progressTimer = null;
+  var tickTimer = null;
+  var countdownTimer = null;
+  var info = null;
+  var closed = false;
+
+  function show(id) {
+    ['loading', 'watch', 'expired', 'error'].forEach(function (name) {
+      document.getElementById(name).hidden = name !== id;
+    });
+  }
+
+  function query() {
+    var q = new URLSearchParams({ action: 'open', src: base.src, device: base.device });
+    if (base.uid) q.set('uid', base.uid); else q.set('bid', base.bid);
+    return CONFIG.GAS_URL + '?' + q.toString();
+  }
+
+  function fetchWithTimeout(url) {
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, CONFIG.TIMEOUT_MS);
+    return fetch(url, { method: 'GET', redirect: 'follow', signal: ctrl ? ctrl.signal : undefined })
+      .then(function (r) { clearTimeout(timer); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); },
+            function (e) { clearTimeout(timer); throw e; });
+  }
+
+  function check(retries) {
+    show('loading');
+    fetchWithTimeout(query()).then(function (res) {
+      if (!res || !res.ok) throw new Error((res && res.error) || 'bad_response');
+      if (res.status === 'open' && res.videoId) startWatch(res);
+      else show('expired');
+    }).catch(function () {
+      if (retries > 0) setTimeout(function () { check(retries - 1); }, 1500);
+      else show('error');
+    });
+  }
+
+  // --- 記録を送る（失敗しても再生は止めない）---
+  function position() {
+    try { return player && player.getCurrentTime ? player.getCurrentTime() || 0 : 0; } catch (e) { return 0; }
+  }
+
+  function send(event, pos) {
+    var body = JSON.stringify({
+      action: 'event', event: event, pos: Math.round((pos == null ? position() : pos) * 10) / 10,
+      t: Math.round(performance.now() - t0),
+      uid: base.uid, bid: base.bid, src: base.src, device: base.device, sid: base.sid
+    });
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon(CONFIG.GAS_URL, new Blob([body], { type: 'text/plain;charset=UTF-8' }))) return;
+    } catch (e) { /* 下で送り直す */ }
+    try {
+      fetch(CONFIG.GAS_URL, { method: 'POST', mode: 'no-cors', keepalive: true, headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: body })
+        .catch(function () {});
+    } catch (e) { /* 1回抜けるのは許す */ }
+  }
+
+  // --- 相談ボタン ---
+  function showConsult() {
+    if (!info || !info.consultUrl || closed) return;
+    var box = document.getElementById('consult');
+    if (box.hidden) {
+      box.hidden = false;
+      storeSet(storage, STORE_CONSULT, '1');
+    }
+  }
+
+  // --- 残り時間（GAS が返した残りミリ秒から数える。端末の時計の「時刻」は使わない）---
+  function startCountdown(remainingMs) {
+    var endAt = Date.now() + remainingMs;
+    function update() {
+      var left = endAt - Date.now();
+      if (left <= 0) { closePage(); return; }
+      document.getElementById('remain').textContent = formatRemaining(left);
+    }
+    update();
+    countdownTimer = setInterval(update, 30000);
+  }
+
+  function closePage() {
+    if (closed) return;
+    if (playing) send('pause');
+    closed = true;
+    playing = false;
+    stopTimers();
+    clearInterval(countdownTimer);
+    try { if (player && player.destroy) player.destroy(); } catch (e) { /* 消せなくても画面は切り替える */ }
+    show('expired');
+  }
+
+  // --- 再生 ---
+  function startTimers() {
+    stopTimers();
+    progressTimer = setInterval(function () { if (playing) send('progress'); }, CONFIG.PROGRESS_SEC * 1000);
+    tickTimer = setInterval(function () {
+      if (info.consultSec > 0 && position() >= info.consultSec) showConsult();
+    }, 1000);
+  }
+
+  function stopTimers() {
+    clearInterval(progressTimer);
+    clearInterval(tickTimer);
+    progressTimer = tickTimer = null;
+  }
+
+  function onStateChange(e) {
+    if (closed) return;
+    var S = YT.PlayerState;
+    if (e.data === S.PLAYING) {
+      if (!playing) { playing = true; send('play'); startTimers(); }
+    } else if (e.data === S.PAUSED) {
+      if (playing) { playing = false; stopTimers(); send('pause'); }
+    } else if (e.data === S.ENDED) {
+      playing = false;
+      stopTimers();
+      var d = 0;
+      try { d = player.getDuration() || 0; } catch (err) { d = 0; }
+      send('ended', d || position());
+      showConsult();
+    }
+    // BUFFERING（読み込み中・位置の移動中）は再生の続きとして扱う
+  }
+
+  function loadPlayer(videoId) {
+    window.onYouTubeIframeAPIReady = function () {
+      player = new YT.Player('player', {
+        videoId: videoId,
+        playerVars: { playsinline: 1, rel: 0, modestbranding: 1 },
+        events: { onStateChange: onStateChange }
+      });
+    };
+    var s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }
+
+  function startWatch(res) {
+    info = res;
+    show('watch');
+    startCountdown(res.remainingMs);
+    var btn = document.getElementById('consultBtn');
+    if (res.consultUrl) btn.href = res.consultUrl;
+    btn.addEventListener('click', function () { send('consult'); });
+    if (res.consultShown || storeGet(storage, STORE_CONSULT) === '1') showConsult();
+    loadPlayer(res.videoId);
+  }
+
+  // 画面を離れるとき、再生中ならそこまでの位置を送っておく（見た合計の取りこぼしを減らす）
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden' && playing) send('progress');
+  });
+  window.addEventListener('pagehide', function () { if (playing) send('progress'); });
+
+  document.getElementById('retry').addEventListener('click', function () { check(1); });
+  check(1);
+}
+
+if (!window.__ZV_TEST__) main();
+</script>
+</body>
+</html>
