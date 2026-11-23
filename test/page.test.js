@@ -88,3 +88,9 @@ test('期限切れの文言が指示書のとおり入っている', () => {
     'もう一度の公開も、終了しました。', 'このあともLINEで、Shopee物販のお役立ち情報をお届けしていきます。',
   ]) assert.ok(text.includes(line), line);
 });
+
+test('uid が要る画面の文言が入っている', () => {
+  assert.ok(HTML.includes('<section id="needUid" class="message" hidden>'));
+  assert.ok(HTML.includes('このページは、LINEに届いたリンクから開いてください。'));
+  assert.ok(HTML.includes("res.status === 'needUid'"));
+});

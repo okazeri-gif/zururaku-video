@@ -112,6 +112,7 @@ test('setup: 3つのタブと見出し・設定の最初の値を作り、2回�
   assert.equal(settings['相談フォームのURL'], '');
   assert.equal(settings['受け付け中'], true);
   assert.equal(settings['再公開（時間）'], 24);
+  assert.equal(settings['uid必須'], false);
   assert.ok(settings['動画ID']);
   assert.equal(ctx.setup(), 'sheet-1');
   assert.equal(ss.sheets.length, 3);
@@ -450,10 +451,10 @@ test('migrate85: 84の本番シートに、足りない設定の行と視聴者�
   const { ctx, tab } = load({ sheet84: true });
   const before = tab('視聴者').data.map(r => [...r]);
   const r = ctx.migrate85();
-  assert.deepEqual([...r.settingsAdded], ['再公開（時間）']);
+  assert.deepEqual([...r.settingsAdded], ['再公開（時間）', 'uid必須']);
   assert.deepEqual([...r.viewerColumnsAdded], ['再公開した時刻', '再公開の期限']);
-  assert.deepEqual(tab('設定').data.at(-1), ['再公開（時間）', 24]);
-  assert.equal(tab('設定').data.length, 8);
+  assert.deepEqual(tab('設定').data.slice(-2), [['再公開（時間）', 24], ['uid必須', false]]);
+  assert.equal(tab('設定').data.length, 9);
   assert.deepEqual(tab('視聴者').data[0], [...HEADERS_84, '再公開した時刻', '再公開の期限']);
   assert.deepEqual(tab('視聴者').data.slice(1), before.slice(1));
 });
@@ -505,4 +506,83 @@ test('列は見出しの名前で読む: 列の順番を入れ替えても動く
   log.data[0] = ['イベント', '時刻', '視聴者ID', 'IDの種類', '経路', '動画の位置（秒）', '端末'];
   ctx.handleOpen_({ uid: 'U1' }, at(81 * HOUR));
   assert.deepEqual(log.data.at(-1).slice(0, 1).concat(log.data.at(-1).slice(2, 4)), ['開いた', 'U1', 'uid']);
+});
+
+// ── uid必須 ─────────────────────────────────────────
+
+test('uid必須が FALSE（最初の値）: uid が無い人もブラウザのIDで見られる（今までどおり）', () => {
+  const { ctx, viewers } = load();
+  assert.equal(ctx.handleOpen_({ bid: 'b1' }, T0).status, 'open');
+  assert.equal(viewers().length, 1);
+});
+
+test('uid必須が TRUE: uid が無い人には動画を出さず、視聴者の行を作らない', () => {
+  const { ctx, setSetting, viewers, logs } = load();
+  setSetting('uid必須', true);
+  const res = ctx.handleOpen_({ bid: 'b1', src: 'taisei', device: 'スマホ' }, T0);
+  assert.deepEqual({ ...res }, { ok: true, status: 'needUid' });
+  assert.equal(res.videoId, undefined);
+  assert.equal(viewers().length, 0);
+  assert.deepEqual(logs().at(-1).slice(1), ['b1', 'browser', 'taisei', 'uid無しで開いた', '', 'スマホ']);
+});
+
+test('uid必須が TRUE: 置き換え失敗の uid・使えない形の uid も「uid が無い」扱い', () => {
+  const { ctx, setSetting, viewers } = load();
+  setSetting('uid必須', 'TRUE');
+  assert.equal(ctx.handleOpen_({ uid: '#_userParamId_#', bid: 'b1' }, T0).status, 'needUid');
+  assert.equal(ctx.handleOpen_({ uid: '=1+1', bid: 'b1' }, T0).status, 'needUid');
+  assert.equal(ctx.handleOpen_({ uid: '', bid: 'b1', again: '1' }, T0).status, 'needUid');
+  assert.equal(viewers().length, 0);
+});
+
+test('uid必須が TRUE: uid がある人は今までどおり（初回・期限切れ・再公開）', () => {
+  const { ctx, setSetting } = load();
+  setSetting('uid必須', true);
+  assert.equal(ctx.handleOpen_({ uid: 'U1' }, T0).status, 'open');
+  assert.equal(ctx.handleOpen_({ uid: 'U1' }, at(80 * HOUR)).status, 'expired');
+  assert.equal(ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR)).remainingMs, 24 * HOUR);
+});
+
+test('uid必須が TRUE: 前にブラウザのIDで見ていた人も、uid が無ければ見られない', () => {
+  const { ctx, setSetting, viewers } = load();
+  ctx.handleOpen_({ bid: 'b1' }, T0);
+  setSetting('uid必須', true);
+  assert.equal(ctx.handleOpen_({ bid: 'b1' }, at(HOUR)).status, 'needUid');
+  assert.equal(viewers()[0][6], 1); // 開いた回数は増やさない
+});
+
+test('uid必須が TRUE: uid の無い人の再生の記録は受け取らない', () => {
+  const { ctx, setSetting, logs } = load();
+  setSetting('uid必須', true);
+  const n = logs().length;
+  assert.equal(ctx.handleEvent_({ event: 'play', pos: 0, t: 0, bid: 'b1', sid: 's' }, T0).ignored, 'need_uid');
+  assert.equal(logs().length, n);
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  assert.equal(ctx.handleEvent_({ event: 'play', pos: 0, t: 0, uid: 'U1', sid: 's' }, T0).ok, true);
+  assert.equal(logs().at(-1)[4], '再生');
+});
+
+test('migrateUidRequired: 85まで入ったシートに「uid必須」＝FALSE だけを足す・2回動かしても同じ', () => {
+  const { ctx, tab } = load({ sheet84: true });
+  ctx.migrate85();
+  // 85まで入った本番のシート（uid必須の行がまだ無い）にする
+  const settings = tab('設定');
+  settings.data.splice(settings.data.findIndex(r => r[0] === 'uid必須'), 1);
+  const viewersBefore = JSON.stringify(tab('視聴者').data);
+  const r1 = ctx.migrateUidRequired();
+  assert.deepEqual([...r1.settingsAdded], ['uid必須']);
+  assert.equal(r1.viewerColumnsAdded.length, 0);
+  assert.deepEqual(settings.data.at(-1), ['uid必須', false]);
+  assert.equal(JSON.stringify(tab('視聴者').data), viewersBefore);
+  // 司令塔が TRUE にしたあとで動かしても、書き換えない
+  settings.data.at(-1)[1] = true;
+  const snapshot = JSON.stringify(settings.data);
+  const r2 = ctx.migrateUidRequired();
+  assert.equal(r2.settingsAdded.length, 0);
+  assert.equal(JSON.stringify(settings.data), snapshot);
+});
+
+test('migrateUidRequired の前: 「uid必須」の行が無ければ FALSE として動く', () => {
+  const { ctx } = load({ sheet84: true });
+  assert.equal(ctx.handleOpen_({ bid: 'TEST9' }, T0).status, 'open');
 });

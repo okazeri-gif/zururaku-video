@@ -77,6 +77,10 @@
     </div>
   </section>
 
+  <section id="needUid" class="message" hidden>
+    <p>このページは、LINEに届いたリンクから開いてください。</p>
+  </section>
+
   <section id="error" class="message" hidden>
     <p>読み込めませんでした。<br>電波の良いところで、もう一度開いてください。</p>
     <button id="retry" class="retry" type="button">もう一度読み込む</button>
@@ -203,7 +207,7 @@ function main() {
   }
 
   function show(id) {
-    ['loading', 'watch', 'expired', 'error'].forEach(function (name) {
+    ['loading', 'watch', 'expired', 'needUid', 'error'].forEach(function (name) {
       document.getElementById(name).hidden = name !== id;
     });
   }
@@ -228,6 +232,7 @@ function main() {
     fetchWithTimeout(query()).then(function (res) {
       if (!res || !res.ok) throw new Error((res && res.error) || 'bad_response');
       if (res.status === 'open' && res.videoId) startWatch(res);
+      else if (res.status === 'needUid') show('needUid');
       else showExpired(expiredVariant(res));
     }).catch(function () {
       if (retries > 0) setTimeout(function () { check(retries - 1); }, 1500);
