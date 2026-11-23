@@ -27,14 +27,21 @@ function fakeSheet(name) {
   return {
     name, data,
     setName(n) { this.name = n; },
-    getRange: (r, c, nr, nc) => (typeof r === 'string' ? range(1, 1) : range(r, c, nr, nc)),
+    getRange: (r, c, nr, nc) => {
+      if (typeof r !== 'number' || typeof c !== 'number') throw new Error('getRange は数字で呼ぶ');
+      return range(r, c, nr, nc);
+    },
     getLastRow: () => data.length,
+    getLastColumn: () => Math.max(0, ...data.map(row => row.length)),
+    getMaxRows: () => Math.max(1000, data.length),
+    getMaxColumns: () => Math.max(26, ...data.map(row => row.length)),
+    insertColumnsAfter: () => {},
     appendRow: row => data.push([...row]),
     setFrozenRows: () => {},
   };
 }
 
-function load() {
+function load({ sheet84 = false } = {}) {
   const props = {};
   const cache = {};
   let ss = null;
@@ -66,6 +73,7 @@ function load() {
   vm.createContext(ctx);
   vm.runInContext(SRC, ctx);
   ctx.setup();
+  if (sheet84) makeSheet84(ss);
   const tab = n => ss.getSheetByName(n);
   const setSetting = (name, value) => {
     const row = tab('設定').data.find(r => r[0] === name);
@@ -76,19 +84,34 @@ function load() {
   return { ctx, ss, tab, setSetting, viewers, logs, cache };
 }
 
+/** 実装指示_84 の時点の本番シート（設定6行・視聴者12列・テストの行2行）に作り変える */
+const HEADERS_84 = ['視聴者ID', 'IDの種類', '経路', '初めて開いた時刻', '期限', '最後に開いた時刻', '開いた回数',
+  '見た一番先の位置（秒）', '見た合計（秒）', '合言葉の位置を通過', '最後まで見た', '相談ボタンを押した'];
+function makeSheet84(ss) {
+  const settings = ss.getSheetByName('設定');
+  settings.data.splice(0, settings.data.length, ['項目', '値'], ['動画ID', 'M7lc1UVf-VE'], ['期限（時間）', 72],
+    ['相談ボタンを出す秒数', 0], ['合言葉の秒数', 0], ['相談フォームのURL', ''], ['受け付け中', true]);
+  const viewers = ss.getSheetByName('視聴者');
+  viewers.data.splice(0, viewers.data.length, [...HEADERS_84],
+    ['TEST1', 'uid', 'taisei', T0, at(72 * HOUR), T0, 1, 0, 0, false, false, false],
+    ['TEST2', 'browser', '', at(-100 * HOUR), at(-28 * HOUR), at(-100 * HOUR), 2, 30, 30, false, false, false]);
+}
+
 // ── setup ─────────────────────────────────────────────
 
 test('setup: 3つのタブと見出し・設定の最初の値を作り、2回目は作り直さない', () => {
   const { ctx, ss, tab } = load();
   assert.deepEqual(ss.sheets.map(s => s.name), ['設定', '視聴ログ', '視聴者']);
   assert.deepEqual(tab('視聴ログ').data[0], ['時刻', '視聴者ID', 'IDの種類', '経路', 'イベント', '動画の位置（秒）', '端末']);
-  assert.equal(tab('視聴者').data[0].length, 12);
+  assert.equal(tab('視聴者').data[0].length, 14);
+  assert.deepEqual(tab('視聴者').data[0].slice(12), ['再公開した時刻', '再公開の期限']);
   const settings = Object.fromEntries(tab('設定').data.slice(1));
   assert.equal(settings['期限（時間）'], 72);
   assert.equal(settings['相談ボタンを出す秒数'], 0);
   assert.equal(settings['合言葉の秒数'], 0);
   assert.equal(settings['相談フォームのURL'], '');
   assert.equal(settings['受け付け中'], true);
+  assert.equal(settings['再公開（時間）'], 24);
   assert.ok(settings['動画ID']);
   assert.equal(ctx.setup(), 'sheet-1');
   assert.equal(ss.sheets.length, 3);
@@ -126,7 +149,7 @@ test('期限: 72時間ちょうどからは見られない', () => {
   const { ctx, logs } = load();
   ctx.handleOpen_({ uid: 'U1' }, T0);
   const res = ctx.handleOpen_({ uid: 'U1' }, at(72 * HOUR));
-  assert.deepEqual({ ...res }, { ok: true, status: 'expired' });
+  assert.deepEqual({ ...res }, { ok: true, status: 'expired', reopenUsed: false });
   assert.equal(logs()[1][4], '期限切れで開いた');
 });
 
@@ -314,4 +337,172 @@ test('doGet / doPost: JSON を返す', () => {
   const post = JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify({ action: 'event', event: 'play', pos: 0, t: 0, uid: 'U1', sid: 's' }) } }).body);
   assert.equal(post.ok, true);
   assert.equal(JSON.parse(ctx.doPost({ postData: { contents: 'not json' } }).body).error, 'server_error');
+});
+
+// ── 再公開（実装指示_85） ───────────────────────────────
+
+/** 状態を作る: 'none' 初めて／'within' 期限内／'expired' 期限切れ・未使用／'reopen' 再公開の期限内／'done' 再公開の期限も切れた */
+function stateAt(ctx, state) {
+  if (state === 'none') return T0;
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  if (state === 'within') return at(10 * HOUR);
+  if (state === 'expired') return at(80 * HOUR);
+  ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR)); // 再公開（80時間目から24時間）
+  if (state === 'reopen') return at(90 * HOUR);
+  return at(104 * HOUR); // 再公開の期限ちょうど
+}
+
+const TABLE = [
+  // 状態, again, 期待する status, reopenUsed（期限切れのとき）, 残り時間, ログのイベント
+  ['none', true, 'open', undefined, 72 * HOUR, '開いた'],
+  ['none', false, 'open', undefined, 72 * HOUR, '開いた'],
+  ['within', true, 'open', undefined, 62 * HOUR, '開いた'],
+  ['within', false, 'open', undefined, 62 * HOUR, '開いた'],
+  ['expired', true, 'open', undefined, 24 * HOUR, '再公開で開いた'],
+  ['expired', false, 'expired', false, undefined, '期限切れで開いた'],
+  ['reopen', true, 'open', undefined, 14 * HOUR, '開いた'],
+  ['reopen', false, 'open', undefined, 14 * HOUR, '開いた'],
+  ['done', true, 'expired', true, undefined, '期限切れで開いた'],
+  ['done', false, 'expired', true, undefined, '期限切れで開いた'],
+];
+for (const [state, again, status, reopenUsed, remaining, label] of TABLE) {
+  test(`再公開の表: ${state} × again ${again ? 'あり' : 'なし'} → ${status}`, () => {
+    const { ctx, viewers, logs } = load();
+    const now = stateAt(ctx, state);
+    const res = ctx.handleOpen_(again ? { uid: 'U1', again: '1' } : { uid: 'U1' }, now);
+    assert.equal(res.status, status);
+    if (status === 'expired') {
+      assert.equal(res.reopenUsed, reopenUsed);
+      assert.equal(res.videoId, undefined);
+    } else {
+      assert.equal(res.remainingMs, remaining);
+    }
+    assert.equal(logs().at(-1)[4], label);
+    assert.equal(viewers().length, 1);
+    assert.equal(logs().filter(r => r[4] === '再公開で開いた').length, ['reopen', 'done'].includes(state) || (state === 'expired' && again) ? 1 : 0);
+  });
+}
+
+test('再公開: 視聴者タブに再公開した時刻と期限が入る・初めの期限は変えない', () => {
+  const { ctx, viewers } = load();
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR));
+  const v = viewers()[0];
+  assert.equal(v[4].getTime(), at(72 * HOUR).getTime());
+  assert.equal(v[12].getTime(), at(80 * HOUR).getTime());
+  assert.equal(v[13].getTime(), at(104 * HOUR).getTime());
+  // 期限内にもう一度 again で開いても、再公開した時刻は変わらない（1回だけ）
+  ctx.handleOpen_({ uid: 'U1', again: '1' }, at(90 * HOUR));
+  assert.equal(viewers()[0][12].getTime(), at(80 * HOUR).getTime());
+});
+
+test('再公開中の残り時間: 再公開の期限から出す・見られる返事の reopenUsed は true', () => {
+  const { ctx } = load();
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  const r1 = ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR));
+  assert.equal(r1.remainingMs, 24 * HOUR);
+  assert.equal(r1.reopenUsed, true);
+  const r2 = ctx.handleOpen_({ uid: 'U1' }, at(103 * HOUR + 30 * 60 * 1000));
+  assert.equal(r2.remainingMs, 30 * 60 * 1000);
+  // 最初の期間に見ている人は、終わったら「まだ使える版」
+  assert.equal(ctx.handleOpen_({ uid: 'U2' }, T0).reopenUsed, false);
+});
+
+test('再公開（時間）が 0: 再公開しない・期限切れは使い終わった版', () => {
+  const { ctx, setSetting, viewers } = load();
+  setSetting('再公開（時間）', 0);
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  const res = ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR));
+  assert.deepEqual({ ...res }, { ok: true, status: 'expired', reopenUsed: true });
+  assert.equal(viewers()[0][12], '');
+  assert.equal(ctx.handleOpen_({ uid: 'U2' }, T0).reopenUsed, true);
+});
+
+test('再公開（時間）を変えると、新しく再公開する人から効く', () => {
+  const { ctx, setSetting } = load();
+  setSetting('再公開（時間）', 6);
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  assert.equal(ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR)).remainingMs, 6 * HOUR);
+});
+
+test('受け付け中が FALSE: again があっても再公開しない・使い終わった版', () => {
+  const { ctx, setSetting, viewers } = load();
+  ctx.handleOpen_({ uid: 'U1' }, T0);
+  setSetting('受け付け中', false);
+  const res = ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR));
+  assert.deepEqual({ ...res }, { ok: true, status: 'expired', reopenUsed: true });
+  assert.equal(viewers()[0][12], '');
+  // 期限内の人も期限切れ
+  assert.equal(ctx.handleOpen_({ uid: 'U1' }, at(HOUR)).status, 'expired');
+});
+
+test('decideOpen_ 単体: 再公開の期限ちょうどからは見られない', () => {
+  const { ctx } = load();
+  const settings = { accepting: true, hours: 72, reopenHours: 24 };
+  const v = { deadline: at(72 * HOUR), reopenDeadline: at(104 * HOUR) };
+  assert.equal(ctx.decideOpen_(v, at(104 * HOUR - 1), settings, false).status, 'open');
+  assert.equal(ctx.decideOpen_(v, at(104 * HOUR), settings, true).status, 'expired');
+});
+
+// ── migrate85 ────────────────────────────────────────
+
+test('migrate85: 84の本番シートに、足りない設定の行と視聴者の列だけを足す（テストの行はそのまま）', () => {
+  const { ctx, tab } = load({ sheet84: true });
+  const before = tab('視聴者').data.map(r => [...r]);
+  const r = ctx.migrate85();
+  assert.deepEqual([...r.settingsAdded], ['再公開（時間）']);
+  assert.deepEqual([...r.viewerColumnsAdded], ['再公開した時刻', '再公開の期限']);
+  assert.deepEqual(tab('設定').data.at(-1), ['再公開（時間）', 24]);
+  assert.equal(tab('設定').data.length, 8);
+  assert.deepEqual(tab('視聴者').data[0], [...HEADERS_84, '再公開した時刻', '再公開の期限']);
+  assert.deepEqual(tab('視聴者').data.slice(1), before.slice(1));
+});
+
+test('migrate85: 2回動かしても同じ・司令塔が書き換えた値を上書きしない', () => {
+  const { ctx, tab, setSetting } = load({ sheet84: true });
+  ctx.migrate85();
+  setSetting('再公開（時間）', 12);
+  const snapshot = JSON.stringify([tab('設定').data, tab('視聴者').data, tab('視聴ログ').data]);
+  const r = ctx.migrate85();
+  assert.equal(r.settingsAdded.length, 0);
+  assert.equal(r.viewerColumnsAdded.length, 0);
+  assert.equal(JSON.stringify([tab('設定').data, tab('視聴者').data, tab('視聴ログ').data]), snapshot);
+});
+
+test('migrate85 のあと: 84のテストの行（期限切れ）が again で再公開できる', () => {
+  const { ctx, viewers } = load({ sheet84: true });
+  ctx.migrate85();
+  const res = ctx.handleOpen_({ bid: 'TEST2', again: '1' }, T0);
+  assert.equal(res.status, 'open');
+  assert.equal(res.remainingMs, 24 * HOUR);
+  assert.equal(viewers()[1][13].getTime(), at(24 * HOUR).getTime());
+});
+
+test('migrate85 の前: 再公開の列が無ければ再公開しない（壊れずに期限切れを返す）', () => {
+  const { ctx, viewers } = load({ sheet84: true });
+  const res = ctx.handleOpen_({ bid: 'TEST2', again: '1' }, T0);
+  assert.equal(res.status, 'expired');
+  assert.equal(res.reopenUsed, true);
+  assert.equal(viewers()[1].length, 12);
+});
+
+test('列は見出しの名前で読む: 列の順番を入れ替えても動く', () => {
+  const { ctx, tab } = load();
+  const sheet = tab('視聴者');
+  // 「経路」と「相談ボタンを押した」の列を入れ替え、知らない列を間に足す
+  sheet.data[0] = ['IDの種類', '視聴者ID', 'メモ', '相談ボタンを押した', '初めて開いた時刻', '期限', '最後に開いた時刻', '開いた回数',
+    '見た一番先の位置（秒）', '見た合計（秒）', '合言葉の位置を通過', '最後まで見た', '経路', '再公開の期限', '再公開した時刻'];
+  ctx.handleOpen_({ uid: 'U1', src: 'taisei' }, T0);
+  sheet.data[1][2] = '司令塔のメモ';
+  ctx.handleEvent_({ event: 'consult', pos: 10, t: 0, uid: 'U1', sid: 's' }, T0);
+  ctx.handleOpen_({ uid: 'U1', again: '1' }, at(80 * HOUR));
+  const row = sheet.data[1];
+  assert.deepEqual([row[0], row[1], row[2], row[3], row[12]], ['uid', 'U1', '司令塔のメモ', true, 'taisei']);
+  assert.equal(row[13].getTime(), at(104 * HOUR).getTime());
+  assert.equal(row[14].getTime(), at(80 * HOUR).getTime());
+  // 視聴ログも見出しの名前で書く
+  const log = tab('視聴ログ');
+  log.data[0] = ['イベント', '時刻', '視聴者ID', 'IDの種類', '経路', '動画の位置（秒）', '端末'];
+  ctx.handleOpen_({ uid: 'U1' }, at(81 * HOUR));
+  assert.deepEqual(log.data.at(-1).slice(0, 1).concat(log.data.at(-1).slice(2, 4)), ['開いた', 'U1', 'uid']);
 });

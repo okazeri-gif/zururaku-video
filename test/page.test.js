@@ -61,3 +61,30 @@ test('端末: スマホ／PC', () => {
   assert.equal(deviceOf('Mozilla/5.0 (Linux; Android 14) Mobile Safari'), 'スマホ');
   assert.equal(deviceOf('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120'), 'PC');
 });
+
+// ── 再公開（実装指示_85） ───────────────────────────────
+
+test('again=1 を読む', () => {
+  const { readAgain } = load();
+  assert.equal(readAgain('?src=taisei&uid=U1&again=1'), true);
+  assert.equal(readAgain('?src=taisei&uid=U1'), false);
+  assert.equal(readAgain('?again=0'), false);
+});
+
+test('期限切れの画面: reopenUsed が false のときだけ「まだ使える版」', () => {
+  const { expiredVariant } = load();
+  assert.equal(expiredVariant({ reopenUsed: false }), 'canReopen');
+  assert.equal(expiredVariant({ reopenUsed: true }), 'used');
+  assert.equal(expiredVariant({}), 'used');
+  assert.equal(expiredVariant(null), 'used');
+});
+
+test('期限切れの文言が指示書のとおり入っている', () => {
+  const text = HTML.replace(/<br>/g, '\n').replace(/<[^>]+>/g, '');
+  for (const line of [
+    'この動画の公開は終了しました',
+    '受け取ってから3日がたったため、見られなくなっています。',
+    '「やっぱり見たい！」という方へ。', 'LINEに「動画視聴希望」と送ってください。', '1回だけ、もう一度見られるようにします。',
+    'もう一度の公開も、終了しました。', 'このあともLINEで、Shopee物販のお役立ち情報をお届けしていきます。',
+  ]) assert.ok(text.includes(line), line);
+});
