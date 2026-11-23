@@ -1,18 +1,23 @@
 /**
- * 動画の視聴ページ（実装指示_84）— 期限の判定と視聴の記録
+ * 動画の視聴ページ（実装指示_84・85）— 期限の判定と視聴の記録
  *
  * ページ（GitHub Pages の index.html）から呼ばれる入口は2つ:
- *   GET  {Webアプリ}?action=open&uid=…（または bid=…）&src=…&device=…
+ *   GET  {Webアプリ}?action=open&uid=…（または bid=…）&src=…&device=…&again=1（任意）
  *        … 「この視聴者は見てよいか」。初めてなら視聴者の行を作り、期限を数え始める。
- *        戻り値（JSON）: { ok, status: 'open' | 'expired', videoId, remainingMs, consultSec, consultUrl, consultShown }
- *        （videoId などは status が open のときだけ入る）
+ *        again=1 は「LINEに『動画視聴希望』と送った人」の合図。期限切れなら1回だけ再公開する（実装指示_85）。
+ *        戻り値（JSON）:
+ *          見られる  { ok, status:'open', videoId, remainingMs, consultSec, consultUrl, consultShown, reopenUsed }
+ *          期限切れ  { ok, status:'expired', reopenUsed }（reopenUsed: true＝再公開を使い終わった／使えない）
  *   POST {Webアプリ}（本文は JSON の文字列。Content-Type は text/plain）
  *        { action:'event', event: play|progress|pause|ended|consult, pos, t, sid, uid|bid, src, device }
  *        … 視聴ログに1行足し、視聴者の行を更新する。t はページ側の経過ミリ秒（見た合計を足すのに使う）。
  *
  * 期限の判定は GAS 側だけでやる（ページ側の時計は使わない）。
- * 設定はスプレッドシートの「設定」タブから読む（コードに直書きしない）。
+ * 設定はスプレッドシートの「設定」タブから項目名で読む（コードに直書きしない）。
+ * 「視聴者」「視聴ログ」タブは見出しの名前で読み書きする（列の位置で決め打ちしない）。
  * IP アドレス・ユーザーエージェントの全文・名前は受け取らないし保存しない（端末は「スマホ／PC」だけをページが送る）。
+ *
+ * 今ある本番のシートには migrate85() を1回動かす（足りない設定の行と視聴者の列だけを足す。何回動かしても同じ）。
  */
 
 var SETTINGS_TAB = '設定';
@@ -30,6 +35,7 @@ var SETTING_NAMES = {
   keywordSec: '合言葉の秒数',
   consultUrl: '相談フォームのURL',
   accepting: '受け付け中',
+  reopenHours: '再公開（時間）',
 };
 var SETTINGS_ROWS = [
   [SETTING_NAMES.videoId, PLACEHOLDER_VIDEO_ID],
@@ -38,16 +44,34 @@ var SETTINGS_ROWS = [
   [SETTING_NAMES.keywordSec, 0],
   [SETTING_NAMES.consultUrl, ''],
   [SETTING_NAMES.accepting, true],
+  [SETTING_NAMES.reopenHours, 24],
 ];
 
-var LOG_HEADERS = ['時刻', '視聴者ID', 'IDの種類', '経路', 'イベント', '動画の位置（秒）', '端末'];
-var VIEWER_HEADERS = [
-  '視聴者ID', 'IDの種類', '経路', '初めて開いた時刻', '期限', '最後に開いた時刻', '開いた回数',
-  '見た一番先の位置（秒）', '見た合計（秒）', '合言葉の位置を通過', '最後まで見た', '相談ボタンを押した',
-];
-var V = {
-  id: 0, type: 1, src: 2, first: 3, deadline: 4, last: 5, opens: 6, maxPos: 7, watched: 8, keyword: 9, ended: 10, consult: 11,
+/** 視聴ログの列（キー → 見出し）。並びは setup() で作るときの順番 */
+var LOG_COLS = {
+  time: '時刻', id: '視聴者ID', type: 'IDの種類', src: '経路', event: 'イベント', pos: '動画の位置（秒）', device: '端末',
 };
+/** 視聴者の列（キー → 見出し）。並びは setup() で作るときの順番。reopenedAt・reopenDeadline は実装指示_85 で右端に足した */
+var VIEWER_COLS = {
+  id: '視聴者ID',
+  type: 'IDの種類',
+  src: '経路',
+  first: '初めて開いた時刻',
+  deadline: '期限',
+  last: '最後に開いた時刻',
+  opens: '開いた回数',
+  maxPos: '見た一番先の位置（秒）',
+  watched: '見た合計（秒）',
+  keyword: '合言葉の位置を通過',
+  ended: '最後まで見た',
+  consult: '相談ボタンを押した',
+  reopenedAt: '再公開した時刻',
+  reopenDeadline: '再公開の期限',
+};
+var LOG_HEADERS = values_(LOG_COLS);
+var VIEWER_HEADERS = values_(VIEWER_COLS);
+/** 日時の書式にする列・文字列の書式にする列 */
+var VIEWER_DATE_KEYS = ['first', 'deadline', 'last', 'reopenedAt', 'reopenDeadline'];
 
 var ID_TYPE_UID = 'uid';
 var ID_TYPE_BROWSER = 'browser';
@@ -55,6 +79,7 @@ var ID_TYPE_BROWSER = 'browser';
 var EVENT_LABELS = {
   open: '開いた',
   openExpired: '期限切れで開いた',
+  reopen: '再公開で開いた',
   play: '再生',
   progress: '再生中',
   pause: '停止',
@@ -72,6 +97,7 @@ var MAX_INTERVAL_SEC = 60;
 var MAX_POS_SEC = 6 * 60 * 60;
 /** 再生の状態（直前の位置と時刻）を覚えておく時間（秒）。CacheService の上限 */
 var STATE_TTL_SEC = 21600;
+var HOUR_MS = 3600 * 1000;
 
 var DATE_FORMAT = 'yyyy-mm-dd hh:mm:ss';
 
@@ -96,19 +122,64 @@ function setup() {
 
   var log = ss.insertSheet(LOG_TAB);
   log.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]);
-  log.getRange('A:A').setNumberFormat(DATE_FORMAT);
-  log.getRange('B:B').setNumberFormat('@');
+  log.getRange(1, 1, log.getMaxRows(), 1).setNumberFormat(DATE_FORMAT);
+  log.getRange(1, 2, log.getMaxRows(), 1).setNumberFormat('@');
   log.setFrozenRows(1);
 
   var viewers = ss.insertSheet(VIEWER_TAB);
   viewers.getRange(1, 1, 1, VIEWER_HEADERS.length).setValues([VIEWER_HEADERS]);
-  viewers.getRange('A:A').setNumberFormat('@');
-  viewers.getRange('D:F').setNumberFormat(DATE_FORMAT);
+  formatViewerColumns_(viewers);
   viewers.setFrozenRows(1);
 
   props.setProperty(SHEET_ID_PROP, ss.getId());
   Logger.log('作りました: ' + ss.getUrl());
   return ss.getId();
+}
+
+/**
+ * 実装指示_85: 今ある本番のシートに、足りないものだけを足す（作り直さない・何回動かしても同じ）。
+ *   - 「設定」タブ: 「再公開（時間）」＝24 の行（無ければ末尾に）
+ *   - 「視聴者」タブ: 「再公開した時刻」「再公開の期限」の列（無ければ右端に）
+ * @return {{settingsAdded:string[], viewerColumnsAdded:string[]}}
+ */
+function migrate85() {
+  var ss = openSheet_();
+  var result = { settingsAdded: [], viewerColumnsAdded: [] };
+
+  var settings = ss.getSheetByName(SETTINGS_TAB);
+  var last = settings.getLastRow();
+  var names = last >= 2 ? settings.getRange(2, 1, last - 1, 1).getValues().map(function (r) { return String(r[0]).trim(); }) : [];
+  SETTINGS_ROWS.forEach(function (row) {
+    if (names.indexOf(row[0]) >= 0) return;
+    settings.getRange(settings.getLastRow() + 1, 1, 1, 2).setValues([row]);
+    names.push(row[0]);
+    result.settingsAdded.push(row[0]);
+  });
+
+  var viewers = ss.getSheetByName(VIEWER_TAB);
+  var headers = headerRow_(viewers);
+  VIEWER_HEADERS.forEach(function (h) {
+    if (headers.indexOf(h) >= 0) return;
+    var col = headers.length + 1;
+    if (viewers.getMaxColumns() < col) viewers.insertColumnsAfter(viewers.getMaxColumns(), col - viewers.getMaxColumns());
+    viewers.getRange(1, col, 1, 1).setValues([[h]]);
+    headers.push(h);
+    result.viewerColumnsAdded.push(h);
+  });
+  formatViewerColumns_(viewers);
+
+  Logger.log('足した設定: ' + (result.settingsAdded.join('、') || 'なし') + '／足した列: ' + (result.viewerColumnsAdded.join('、') || 'なし'));
+  return result;
+}
+
+function formatViewerColumns_(sheet) {
+  var cols = headerIndex_(sheet);
+  var rows = sheet.getMaxRows();
+  if (cols[VIEWER_COLS.id] != null) sheet.getRange(1, cols[VIEWER_COLS.id] + 1, rows, 1).setNumberFormat('@');
+  VIEWER_DATE_KEYS.forEach(function (k) {
+    var c = cols[VIEWER_COLS[k]];
+    if (c != null) sheet.getRange(2, c + 1, Math.max(1, rows - 1), 1).setNumberFormat(DATE_FORMAT);
+  });
 }
 
 // ── 入口 ──────────────────────────────────────────────
@@ -144,37 +215,78 @@ function json_(obj) {
 function handleOpen_(p, now) {
   var who = normalizeViewer_(p);
   if (!who) return { ok: false, error: 'no_viewer' };
+  var again = String(p.again || '') === '1';
   var ss = openSheet_();
   var settings = readSettings_(ss);
 
   return withLock_(function () {
     var sheet = ss.getSheetByName(VIEWER_TAB);
-    var found = findViewer_(sheet, who.id, who.idType);
-    var row = found ? found.values : null;
+    var table = viewerTable_(sheet);
+    // 「視聴者」タブに再公開の列がまだ無い（migrate85 の前）ときは、再公開しない
+    if (!table.has.reopenedAt || !table.has.reopenDeadline) settings.reopenHours = 0;
 
-    // 受け付けを止めているときは、新しい人の期限を数え始めない（行を作らない）
-    if (!row && settings.accepting) row = newViewerRow_(who, now, settings.hours);
-    if (row) {
-      row[V.last] = now;
-      row[V.opens] = toNumber_(row[V.opens]) + 1;
-      if (!row[V.src] && who.src) row[V.src] = who.src;
-      writeViewer_(sheet, found, row);
+    var found = findViewer_(table, who.id, who.idType);
+    var d = decideOpen_(found ? found.v : null, now, settings, again);
+
+    var v = found ? found.v : null;
+    if (d.action === 'create') v = newViewer_(who, now, settings.hours);
+    if (d.action === 'reopen') {
+      v.reopenedAt = now;
+      v.reopenDeadline = new Date(now.getTime() + settings.reopenHours * HOUR_MS);
     }
+    if (v) {
+      v.last = now;
+      v.opens = toNumber_(v.opens) + 1;
+      if (!v.src && who.src) v.src = who.src;
+      writeViewer_(sheet, table, found, v);
+    }
+    appendLog_(ss, now, who, d.label, '');
 
-    var verdict = settings.accepting && row ? judge_(row[V.deadline], now) : { status: 'expired', remainingMs: 0 };
-    appendLog_(ss, now, who, verdict.status === 'open' ? EVENT_LABELS.open : EVENT_LABELS.openExpired, '');
-
-    if (verdict.status !== 'open') return { ok: true, status: 'expired' };
+    if (d.status !== 'open') return { ok: true, status: 'expired', reopenUsed: d.reopenUsed };
     return {
       ok: true,
       status: 'open',
       videoId: settings.videoId,
-      remainingMs: verdict.remainingMs,
+      remainingMs: d.remainingMs,
       consultSec: settings.consultSec,
       consultUrl: settings.consultUrl,
-      consultShown: consultShown_(row, settings),
+      consultShown: consultShown_(v, settings),
+      // この期間が終わったときに出す期限切れの画面（true＝使い終わった版）。再公開中か、再公開（時間）が0なら true
+      reopenUsed: d.reopenUsed || !(settings.reopenHours > 0),
     };
   });
+}
+
+/**
+ * 開いたときにどうするかを決める（シートには触らない）。実装指示_85 の表のとおり。
+ *   受け付け中が FALSE … 全員に期限切れ。再公開もしない（reopenUsed=true：「LINEに送って」を出さない）
+ *   行が無い          … 初回（again があっても普通の初回。72時間が始まる）
+ *   期限内            … 見せる（again は使わない）
+ *   再公開の期限がある … その期限内なら見せる（again が無くても）。過ぎたら使い終わった版
+ *   期限切れ・未使用   … again=1 かつ 再公開（時間）> 0 なら再公開。そうでなければ期限切れ
+ *                        （再公開（時間）が 0 なら使い終わった版、それ以外はまだ使える版）
+ * @return {{action:'create'|'reopen'|'none', status:'open'|'expired', remainingMs:number, reopenUsed:boolean, label:string}}
+ */
+function decideOpen_(v, now, settings, again) {
+  var expired = function (used) {
+    return { action: 'none', status: 'expired', remainingMs: 0, reopenUsed: used, label: EVENT_LABELS.openExpired };
+  };
+  if (!settings.accepting) return expired(true);
+  if (!v) return { action: 'create', status: 'open', remainingMs: settings.hours * HOUR_MS, reopenUsed: false, label: EVENT_LABELS.open };
+
+  var first = judge_(v.deadline, now);
+  if (first.status === 'open') return { action: 'none', status: 'open', remainingMs: first.remainingMs, reopenUsed: false, label: EVENT_LABELS.open };
+
+  if (isFinite(toTime_(v.reopenDeadline))) {
+    var second = judge_(v.reopenDeadline, now);
+    if (second.status === 'open') return { action: 'none', status: 'open', remainingMs: second.remainingMs, reopenUsed: true, label: EVENT_LABELS.open };
+    return expired(true);
+  }
+
+  if (settings.reopenHours > 0 && again) {
+    return { action: 'reopen', status: 'open', remainingMs: settings.reopenHours * HOUR_MS, reopenUsed: true, label: EVENT_LABELS.reopen };
+  }
+  return expired(!(settings.reopenHours > 0));
 }
 
 /**
@@ -188,27 +300,29 @@ function judge_(deadline, now) {
   return remaining > 0 ? { status: 'open', remainingMs: remaining } : { status: 'expired', remainingMs: 0 };
 }
 
-function newViewerRow_(who, now, hours) {
-  var row = [];
-  row[V.id] = who.id;
-  row[V.type] = who.idType;
-  row[V.src] = who.src;
-  row[V.first] = now;
-  row[V.deadline] = new Date(now.getTime() + hours * 3600 * 1000);
-  row[V.last] = now;
-  row[V.opens] = 0;
-  row[V.maxPos] = 0;
-  row[V.watched] = 0;
-  row[V.keyword] = false;
-  row[V.ended] = false;
-  row[V.consult] = false;
-  return row;
+function newViewer_(who, now, hours) {
+  return {
+    id: who.id,
+    type: who.idType,
+    src: who.src,
+    first: now,
+    deadline: new Date(now.getTime() + hours * HOUR_MS),
+    last: now,
+    opens: 0,
+    maxPos: 0,
+    watched: 0,
+    keyword: false,
+    ended: false,
+    consult: false,
+    reopenedAt: '',
+    reopenDeadline: '',
+  };
 }
 
 /** 相談ボタンを最初から出しておくか（一度出る条件を満たした人） */
-function consultShown_(row, settings) {
-  if (toBool_(row[V.ended]) || toBool_(row[V.consult])) return true;
-  return settings.consultSec > 0 && toNumber_(row[V.maxPos]) >= settings.consultSec;
+function consultShown_(v, settings) {
+  if (toBool_(v.ended) || toBool_(v.consult)) return true;
+  return settings.consultSec > 0 && toNumber_(v.maxPos) >= settings.consultSec;
 }
 
 // ── 記録 ──────────────────────────────────────────────
@@ -229,30 +343,31 @@ function handleEvent_(b, now) {
     appendLog_(ss, now, who, EVENT_LABELS[event], pos);
 
     var sheet = ss.getSheetByName(VIEWER_TAB);
-    var found = findViewer_(sheet, who.id, who.idType);
+    var table = viewerTable_(sheet);
+    var found = findViewer_(table, who.id, who.idType);
     if (!found) return { ok: true, viewer: false };
-    var row = found.values;
+    var v = found.v;
 
     // 見た合計: 直前の記録（同じページの開き方＝sid ごと）との間隔から足す
     if (sid && isFinite(ev.t)) {
       var cache = CacheService.getScriptCache();
       var key = 'w:' + who.idType + ':' + who.id + ':' + sid;
       var acc = accumulateWatched_(parseState_(cache.get(key)), ev);
-      if (acc.add > 0) row[V.watched] = round1_(toNumber_(row[V.watched]) + acc.add);
+      if (acc.add > 0) v.watched = round1_(toNumber_(v.watched) + acc.add);
       cache.put(key, JSON.stringify(acc.state), STATE_TTL_SEC);
     }
 
-    if (event !== 'consult' && pos > toNumber_(row[V.maxPos])) row[V.maxPos] = pos;
-    if (event === 'ended') row[V.ended] = true;
-    if (event === 'consult') row[V.consult] = true;
+    if (event !== 'consult' && pos > toNumber_(v.maxPos)) v.maxPos = pos;
+    if (event === 'ended') v.ended = true;
+    if (event === 'consult') v.consult = true;
 
     // 合言葉の位置を通過（秒数が0なら、最後まで見たときに通過とする）
-    if (!toBool_(row[V.keyword]) && keywordPassed_(ev, settings.keywordSec)) {
-      row[V.keyword] = true;
+    if (!toBool_(v.keyword) && keywordPassed_(ev, settings.keywordSec)) {
+      v.keyword = true;
       appendLog_(ss, now, who, EVENT_LABELS.keyword, pos);
     }
 
-    writeViewer_(sheet, found, row);
+    writeViewer_(sheet, table, found, v);
     return { ok: true };
   });
 }
@@ -316,34 +431,79 @@ function readSettings_(ss) {
     consultSec: Math.max(0, toNumber_(map[SETTING_NAMES.consultSec])),
     keywordSec: Math.max(0, toNumber_(map[SETTING_NAMES.keywordSec])),
     consultUrl: /^https:\/\//i.test(url) ? url : '',
+    // 行が無い（migrate85 の前）ときは 0＝再公開しない
+    reopenHours: Math.max(0, toNumber_(map[SETTING_NAMES.reopenHours])),
     // 空や読めない値は「受け付け中」とみなす。FALSE と書いたときだけ止める
     accepting: !(accepting === false || String(accepting).trim().toUpperCase() === 'FALSE'),
   };
 }
 
-function findViewer_(sheet, id, idType) {
+/** 1行目の見出し（右端の空の見出しは除く） */
+function headerRow_(sheet) {
+  var width = sheet.getLastColumn();
+  if (width < 1) return [];
+  var row = sheet.getRange(1, 1, 1, width).getValues()[0].map(function (h) { return String(h).trim(); });
+  while (row.length && !row[row.length - 1]) row.pop();
+  return row;
+}
+
+/** 見出し → 列の位置（0始まり） */
+function headerIndex_(sheet) {
+  var idx = {};
+  headerRow_(sheet).forEach(function (h, i) { if (h && idx[h] == null) idx[h] = i; });
+  return idx;
+}
+
+/** 「視聴者」タブを見出しの名前で読む準備。has[キー] はその列があるか */
+function viewerTable_(sheet) {
+  var idx = headerIndex_(sheet);
+  var cols = {};
+  var has = {};
+  Object.keys(VIEWER_COLS).forEach(function (k) {
+    if (idx[VIEWER_COLS[k]] != null) { cols[k] = idx[VIEWER_COLS[k]]; has[k] = true; }
+  });
+  if (!has.id || !has.type) throw new Error('「視聴者」タブに「視聴者ID」「IDの種類」の見出しがありません');
+  return { sheet: sheet, cols: cols, has: has, width: Math.max(headerRow_(sheet).length, 1) };
+}
+
+function findViewer_(table, id, idType) {
+  var sheet = table.sheet;
   var last = sheet.getLastRow();
   if (last < 2) return null;
-  var keys = sheet.getRange(2, 1, last - 1, 2).getValues();
-  for (var i = 0; i < keys.length; i++) {
-    if (String(keys[i][0]) === id && String(keys[i][1]) === idType) {
-      var rowIndex = i + 2;
-      return { rowIndex: rowIndex, values: sheet.getRange(rowIndex, 1, 1, VIEWER_HEADERS.length).getValues()[0] };
+  var rows = sheet.getRange(2, 1, last - 1, table.width).getValues();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][table.cols.id]) === id && String(rows[i][table.cols.type]) === idType) {
+      var v = {};
+      Object.keys(table.cols).forEach(function (k) { v[k] = rows[i][table.cols[k]]; });
+      return { rowIndex: i + 2, raw: rows[i], v: v };
     }
   }
   return null;
 }
 
-function writeViewer_(sheet, found, row) {
-  var values = [];
-  for (var i = 0; i < VIEWER_HEADERS.length; i++) values.push(row[i] === undefined ? '' : row[i]);
+/** 見出しのある列だけを書く（知らない列・見出しの無い列の値はそのまま残す） */
+function writeViewer_(sheet, table, found, v) {
+  var raw = found ? found.raw.slice() : [];
+  while (raw.length < table.width) raw.push('');
+  Object.keys(table.cols).forEach(function (k) {
+    if (v[k] !== undefined) raw[table.cols[k]] = v[k];
+  });
   var rowIndex = found ? found.rowIndex : sheet.getLastRow() + 1;
-  sheet.getRange(rowIndex, 1, 1, values.length).setValues([values]);
-  if (found) found.values = values;
+  sheet.getRange(rowIndex, 1, 1, raw.length).setValues([raw]);
+  if (found) { found.raw = raw; found.v = v; }
 }
 
 function appendLog_(ss, now, who, label, pos) {
-  ss.getSheetByName(LOG_TAB).appendRow([now, who.id, who.idType, who.src, label, pos, who.device]);
+  var sheet = ss.getSheetByName(LOG_TAB);
+  var idx = headerIndex_(sheet);
+  var values = { time: now, id: who.id, type: who.idType, src: who.src, event: label, pos: pos, device: who.device };
+  var row = [];
+  var width = headerRow_(sheet).length;
+  for (var i = 0; i < width; i++) row.push('');
+  Object.keys(LOG_COLS).forEach(function (k) {
+    if (idx[LOG_COLS[k]] != null) row[idx[LOG_COLS[k]]] = values[k];
+  });
+  sheet.appendRow(row);
 }
 
 function withLock_(fn) {
@@ -415,6 +575,10 @@ function toTime_(v) {
   if (typeof v === 'number') return v;
   if (v === '' || v == null) return NaN;
   return new Date(v).getTime();
+}
+
+function values_(obj) {
+  return Object.keys(obj).map(function (k) { return obj[k]; });
 }
 
 function round1_(n) {

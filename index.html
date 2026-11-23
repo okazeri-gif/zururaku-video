@@ -42,6 +42,7 @@
   .message { padding: 48px 16px; text-align: center; }
   .message h2 { margin: 0 0 16px; font-size: 20px; color: var(--orange-dark); }
   .message p { margin: 0; font-size: 15px; }
+  .message p.spaced { margin-top: 1.4em; }
   .retry { margin-top: 20px; padding: 10px 20px; border: 1px solid var(--orange); border-radius: 999px; background: #fff; color: var(--orange-dark); font-size: 15px; }
 </style>
 </head>
@@ -65,7 +66,15 @@
 
   <section id="expired" class="message" hidden>
     <h2>この動画の公開は終了しました</h2>
-    <p>受け取ってから3日がたったため、見られなくなっています。<br>このあともLINEで、Shopee物販のお役立ち情報をお届けしていきます。</p>
+    <!-- 再公開をまだ使っていない人 -->
+    <div id="expiredCanReopen" hidden>
+      <p>受け取ってから3日がたったため、見られなくなっています。</p>
+      <p class="spaced">「やっぱり見たい！」という方へ。<br>LINEに「動画視聴希望」と送ってください。<br>1回だけ、もう一度見られるようにします。</p>
+    </div>
+    <!-- 再公開を使い終わった人（設定が0のときも同じ） -->
+    <div id="expiredUsed">
+      <p>もう一度の公開も、終了しました。<br>このあともLINEで、Shopee物販のお役立ち情報をお届けしていきます。</p>
+    </div>
   </section>
 
   <section id="error" class="message" hidden>
@@ -126,6 +135,16 @@ function readUid(search) {
   return u;
 }
 
+/** again=1 …「LINEに『動画視聴希望』と送った人」に届くURLの合図（実装指示_85） */
+function readAgain(search) {
+  return new URLSearchParams(search).get('again') === '1';
+}
+
+/** 期限切れの画面の出し分け。reopenUsed が true でなければ「まだ使える版」 */
+function expiredVariant(res) {
+  return res && res.reopenUsed === false ? 'canReopen' : 'used';
+}
+
 function readSrc(search) {
   return (new URLSearchParams(search).get('src') || '').trim();
 }
@@ -167,6 +186,7 @@ function main() {
     device: deviceOf(navigator.userAgent),
     sid: randomId()
   };
+  var again = readAgain(search);
   var t0 = performance.now();
   var player = null;
   var playing = false;
@@ -175,6 +195,12 @@ function main() {
   var countdownTimer = null;
   var info = null;
   var closed = false;
+
+  function showExpired(variant) {
+    document.getElementById('expiredCanReopen').hidden = variant !== 'canReopen';
+    document.getElementById('expiredUsed').hidden = variant === 'canReopen';
+    show('expired');
+  }
 
   function show(id) {
     ['loading', 'watch', 'expired', 'error'].forEach(function (name) {
@@ -185,6 +211,7 @@ function main() {
   function query() {
     var q = new URLSearchParams({ action: 'open', src: base.src, device: base.device });
     if (base.uid) q.set('uid', base.uid); else q.set('bid', base.bid);
+    if (again) q.set('again', '1');
     return CONFIG.GAS_URL + '?' + q.toString();
   }
 
@@ -201,7 +228,7 @@ function main() {
     fetchWithTimeout(query()).then(function (res) {
       if (!res || !res.ok) throw new Error((res && res.error) || 'bad_response');
       if (res.status === 'open' && res.videoId) startWatch(res);
-      else show('expired');
+      else showExpired(expiredVariant(res));
     }).catch(function () {
       if (retries > 0) setTimeout(function () { check(retries - 1); }, 1500);
       else show('error');
@@ -258,7 +285,7 @@ function main() {
     stopTimers();
     clearInterval(countdownTimer);
     try { if (player && player.destroy) player.destroy(); } catch (e) { /* 消せなくても画面は切り替える */ }
-    show('expired');
+    showExpired(expiredVariant(info));
   }
 
   // --- 再生 ---
