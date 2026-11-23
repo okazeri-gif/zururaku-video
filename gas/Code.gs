@@ -8,6 +8,7 @@
  *        戻り値（JSON）:
  *          見られる  { ok, status:'open', videoId, remainingMs, consultSec, consultUrl, consultShown, reopenUsed }
  *          期限切れ  { ok, status:'expired', reopenUsed }（reopenUsed: true＝再公開を使い終わった／使えない）
+ *          uid が要る { ok, status:'needUid' }（設定「uid必須」が TRUE で、使える uid が無い。視聴者の行は作らない）
  *   POST {Webアプリ}（本文は JSON の文字列。Content-Type は text/plain）
  *        { action:'event', event: play|progress|pause|ended|consult, pos, t, sid, uid|bid, src, device }
  *        … 視聴ログに1行足し、視聴者の行を更新する。t はページ側の経過ミリ秒（見た合計を足すのに使う）。
@@ -17,7 +18,7 @@
  * 「視聴者」「視聴ログ」タブは見出しの名前で読み書きする（列の位置で決め打ちしない）。
  * IP アドレス・ユーザーエージェントの全文・名前は受け取らないし保存しない（端末は「スマホ／PC」だけをページが送る）。
  *
- * 今ある本番のシートには migrate85() を1回動かす（足りない設定の行と視聴者の列だけを足す。何回動かしても同じ）。
+ * 今ある本番のシートには migrate85()／migrateUidRequired() を動かす（足りない設定の行と視聴者の列だけを足す。何回動かしても同じ）。
  */
 
 var SETTINGS_TAB = '設定';
@@ -36,6 +37,7 @@ var SETTING_NAMES = {
   consultUrl: '相談フォームのURL',
   accepting: '受け付け中',
   reopenHours: '再公開（時間）',
+  uidRequired: 'uid必須',
 };
 var SETTINGS_ROWS = [
   [SETTING_NAMES.videoId, PLACEHOLDER_VIDEO_ID],
@@ -45,6 +47,7 @@ var SETTINGS_ROWS = [
   [SETTING_NAMES.consultUrl, ''],
   [SETTING_NAMES.accepting, true],
   [SETTING_NAMES.reopenHours, 24],
+  [SETTING_NAMES.uidRequired, false],
 ];
 
 /** 視聴ログの列（キー → 見出し）。並びは setup() で作るときの順番 */
@@ -79,6 +82,7 @@ var ID_TYPE_BROWSER = 'browser';
 var EVENT_LABELS = {
   open: '開いた',
   openExpired: '期限切れで開いた',
+  openNoUid: 'uid無しで開いた',
   reopen: '再公開で開いた',
   play: '再生',
   progress: '再生中',
@@ -143,6 +147,19 @@ function setup() {
  * @return {{settingsAdded:string[], viewerColumnsAdded:string[]}}
  */
 function migrate85() {
+  return migrateSheets_();
+}
+
+/**
+ * 「uid必須」: 今ある本番のシートの「設定」タブに「uid必須」＝FALSE の行を足す（無ければ末尾に）。
+ * 中身は migrate85 と同じ（足りない設定の行と視聴者の列を全部足す。何回動かしても同じ）。
+ */
+function migrateUidRequired() {
+  return migrateSheets_();
+}
+
+/** 足りない設定の行（SETTINGS_ROWS の順で末尾に）と、視聴者の列（右端に）だけを足す。今ある値は書き換えない */
+function migrateSheets_() {
   var ss = openSheet_();
   var result = { settingsAdded: [], viewerColumnsAdded: [] };
 
@@ -218,6 +235,14 @@ function handleOpen_(p, now) {
   var again = String(p.again || '') === '1';
   var ss = openSheet_();
   var settings = readSettings_(ss);
+
+  // uid必須のときは、使える uid が無い人に動画を出さない。視聴者の行は作らない（ログに1行だけ残す）
+  if (settings.uidRequired && who.idType !== ID_TYPE_UID) {
+    return withLock_(function () {
+      appendLog_(ss, now, who, EVENT_LABELS.openNoUid, '');
+      return { ok: true, status: 'needUid' };
+    });
+  }
 
   return withLock_(function () {
     var sheet = ss.getSheetByName(VIEWER_TAB);
@@ -338,6 +363,8 @@ function handleEvent_(b, now) {
 
   var ss = openSheet_();
   var settings = readSettings_(ss);
+  // uid必須のときは、uid の無い人の再生の記録は受け取らない（動画を出していないので、来るのはおかしな記録だけ）
+  if (settings.uidRequired && who.idType !== ID_TYPE_UID) return { ok: true, ignored: 'need_uid' };
 
   return withLock_(function () {
     appendLog_(ss, now, who, EVENT_LABELS[event], pos);
@@ -433,6 +460,8 @@ function readSettings_(ss) {
     consultUrl: /^https:\/\//i.test(url) ? url : '',
     // 行が無い（migrate85 の前）ときは 0＝再公開しない
     reopenHours: Math.max(0, toNumber_(map[SETTING_NAMES.reopenHours])),
+    // 行が無い・空・TRUE 以外は FALSE（今までどおり、uid の無い人にもブラウザのIDで見せる）
+    uidRequired: toBool_(map[SETTING_NAMES.uidRequired]),
     // 空や読めない値は「受け付け中」とみなす。FALSE と書いたときだけ止める
     accepting: !(accepting === false || String(accepting).trim().toUpperCase() === 'FALSE'),
   };
